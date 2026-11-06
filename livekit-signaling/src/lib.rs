@@ -216,6 +216,16 @@ pub struct SignalOptions {
     ///
     /// The default token is never cancelled.
     pub cancellation_token: CancellationToken,
+    /// Ask the server to run full ICE instead of ICE-lite for this connection.
+    ///
+    /// A full ICE server sends connectivity checks of its own. A client whose only reachable
+    /// address is one that a check must arrive at first, such as a forwarder that learns of the
+    /// client from the server's check, needs this. Sent as `ConnectionSettings.disable_ice_lite`
+    /// on the v1 path and as the `disable_ice_lite` query parameter on the v0 path. A server that
+    /// already runs full ICE is not affected.
+    ///
+    /// Defaults to `false`.
+    pub disable_ice_lite: bool,
 }
 
 impl Default for SignalOptions {
@@ -231,6 +241,7 @@ impl Default for SignalOptions {
             client_capabilities: CLIENT_CAPABILITIES.to_vec(),
             client_protocol: CLIENT_PROTOCOL_VERSION,
             cancellation_token: CancellationToken::new(),
+            disable_ice_lite: false,
         }
     }
 }
@@ -1044,6 +1055,7 @@ fn create_join_request_param(
     let connection_settings = proto::ConnectionSettings {
         auto_subscribe: options.auto_subscribe,
         adaptive_stream: options.adaptive_stream,
+        disable_ice_lite: options.disable_ice_lite,
         ..Default::default()
     };
 
@@ -1178,6 +1190,10 @@ fn get_livekit_url(
             .append_pair("client_protocol", options.client_protocol.to_string().as_str())
             .append_pair("auto_subscribe", if options.auto_subscribe { "1" } else { "0" })
             .append_pair("adaptive_stream", if options.adaptive_stream { "1" } else { "0" });
+
+        if options.disable_ice_lite {
+            lk_url.query_pairs_mut().append_pair("disable_ice_lite", "1");
+        }
 
         if let Some(sdk_version) = &options.sdk_options.sdk_version {
             lk_url.query_pairs_mut().append_pair("version", sdk_version.as_str());
@@ -2127,6 +2143,48 @@ mod tests {
 
         assert_eq!(client_info.sdk, proto::client_info::Sdk::Cpp as i32);
         assert_eq!(client_info.version, "9.9.9-test");
+    }
+
+    #[test]
+    fn livekit_url_asks_for_full_ice_on_both_paths_when_set() {
+        let mut io = SignalOptions::default();
+        io.disable_ice_lite = true;
+
+        // v1 path: inside the join_request's connection settings
+        let lk_url =
+            get_livekit_url("wss://localhost:7880", &io, true, false, None, "", None).unwrap();
+        let join_request_param = lk_url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "join_request").then(|| value.into_owned()))
+            .unwrap();
+        let join_request = decode_join_request_param_for_test(&join_request_param);
+        assert!(join_request.connection_settings.unwrap().disable_ice_lite);
+
+        // v0 path: a query param
+        let lk_url =
+            get_livekit_url("wss://localhost:7880", &io, false, false, None, "", None).unwrap();
+        let param = lk_url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "disable_ice_lite").then(|| value.into_owned()));
+        assert_eq!(param.as_deref(), Some("1"));
+    }
+
+    #[test]
+    fn livekit_url_leaves_ice_lite_alone_by_default() {
+        let io = SignalOptions::default();
+
+        let lk_url =
+            get_livekit_url("wss://localhost:7880", &io, true, false, None, "", None).unwrap();
+        let join_request_param = lk_url
+            .query_pairs()
+            .find_map(|(key, value)| (key == "join_request").then(|| value.into_owned()))
+            .unwrap();
+        let join_request = decode_join_request_param_for_test(&join_request_param);
+        assert!(!join_request.connection_settings.unwrap().disable_ice_lite);
+
+        let lk_url =
+            get_livekit_url("wss://localhost:7880", &io, false, false, None, "", None).unwrap();
+        assert!(lk_url.query_pairs().all(|(key, _)| key != "disable_ice_lite"));
     }
 
     #[test]
