@@ -190,6 +190,9 @@ impl From<RtcConfiguration> for sys_pc::ffi::RtcConfiguration {
             continual_gathering_policy: value.continual_gathering_policy.into(),
             ice_transport_type: value.ice_transport_type.into(),
             enable_sctp_snap: value.enable_sctp_snap,
+            min_port: value.port_range.map_or(0, |(min, _)| min),
+            max_port: value.port_range.map_or(0, |(_, max)| max),
+            disable_tcp_candidates: value.disable_tcp_candidates,
         }
     }
 }

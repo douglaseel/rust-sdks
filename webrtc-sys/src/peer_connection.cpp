@@ -57,6 +57,16 @@ webrtc::PeerConnectionInterface::RTCConfiguration to_native_rtc_configuration(
 
   rtc_config.enable_sctp_snap = config.enable_sctp_snap;
 
+  if (config.min_port != 0 || config.max_port != 0) {
+    rtc_config.port_allocator_config.min_port = config.min_port;
+    rtc_config.port_allocator_config.max_port = config.max_port;
+  }
+
+  if (config.disable_tcp_candidates) {
+    rtc_config.tcp_candidate_policy =
+        webrtc::PeerConnectionInterface::kTcpCandidatePolicyDisabled;
+  }
+
   return rtc_config;
 }
 

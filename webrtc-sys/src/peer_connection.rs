@@ -104,6 +104,12 @@ pub mod ffi {
         // WARP/SNAP: enable SCTP-INIT-in-SDP. Must be carried consistently across
         // create + set_configuration (it is an immutable RTCConfiguration field).
         pub enable_sctp_snap: bool,
+        /// Inclusive local UDP port range for ICE. Both zero leaves the
+        /// allocator's default range.
+        pub min_port: u16,
+        pub max_port: u16,
+        /// Gather no TCP candidates.
+        pub disable_tcp_candidates: bool,
     }
 
     extern "C++" {
