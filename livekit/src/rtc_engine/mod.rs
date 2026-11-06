@@ -30,6 +30,7 @@ use tokio::sync::{
 };
 use tokio::task::JoinHandle;
 
+pub use self::ice_forwarder::{IceCredentials, IceForwarder};
 pub use self::rtc_session::{SessionStats, INITIAL_BUFFERED_AMOUNT_LOW_THRESHOLD};
 use crate::prelude::ParticipantIdentity;
 use crate::{
@@ -46,6 +47,7 @@ use crate::{
 use crate::{ChatMessage, E2eeManager, TranscriptionSegment};
 
 mod dc_sender;
+pub mod ice_forwarder;
 pub mod lk_runtime;
 mod peer_transport;
 mod reconnect_strategy;
@@ -125,6 +127,8 @@ pub struct EngineOptions {
     pub join_retries: u32,
     /// Enable single peer connection mode
     pub single_peer_connection: bool,
+    /// Send all media through this forwarder. See [`ice_forwarder`].
+    pub ice_forwarder: Option<ice_forwarder::IceForwarder>,
 }
 
 #[derive(Debug)]
@@ -495,6 +499,12 @@ impl EngineInner {
         options: EngineOptions,
         e2ee_manager: Option<E2eeManager>,
     ) -> EngineResult<(Arc<Self>, proto::JoinResponse, EngineEvents)> {
+        // A bad forwarder is a bad configuration: no join attempt can succeed
+        // with it, so refuse it before the retry loop.
+        if let Some(fwd) = &options.ice_forwarder {
+            fwd.validate().map_err(|e| EngineError::Internal(e.into()))?;
+        }
+
         let lk_runtime = LkRuntime::instance();
         let max_retries = options.join_retries;
 
@@ -1312,6 +1322,37 @@ fn auth_failure_reason(err: &EngineError) -> Option<DisconnectReason> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn an_invalid_ice_forwarder_fails_before_any_join_attempt() {
+        let mut signal_options = SignalOptions::default();
+        signal_options.single_peer_connection = true;
+        let options = EngineOptions {
+            join_retries: 3,
+            single_peer_connection: true,
+            signal_options,
+            ice_forwarder: Some(ice_forwarder::IceForwarder {
+                addresses: vec!["203.0.113.10:443".parse().unwrap()],
+                credentials: ice_forwarder::IceCredentials {
+                    ufrag: "abc".into(),
+                    pwd: "a".repeat(22),
+                },
+                local_port: 50001,
+            }),
+            ..Default::default()
+        };
+        // Nothing listens here: a join attempt would fail with a signal error.
+        let started = std::time::Instant::now();
+        let err = RtcEngine::connect("ws://127.0.0.1:9", "token", options, None)
+            .await
+            .err()
+            .expect("an invalid forwarder must fail the connect");
+        assert!(
+            matches!(&err, EngineError::Internal(msg) if msg.contains("ice forwarder: ufrag")),
+            "unexpected error: {err:?}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     #[test]
     fn leave_disconnect_reason_returns_some_only_for_disconnect_action() {

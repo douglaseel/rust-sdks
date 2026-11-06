@@ -151,6 +151,10 @@ impl FfiRoom {
         let async_id = server.resolve_async_id(connect.request_async_id);
 
         let req = connect.clone();
+        let ice_forwarder = match req.options.rtc_config.as_ref() {
+            Some(rtc_config) => crate::conversion::room::ice_forwarder_from_proto(rtc_config),
+            None => Ok(None),
+        };
         let mut options: RoomOptions = connect.options.into();
 
         {
@@ -162,6 +166,21 @@ impl FfiRoom {
         }
 
         let connect = async move {
+            match ice_forwarder {
+                Ok(forwarder) => options.ice_forwarder = forwarder,
+                Err(e) => {
+                    log::error!("error while connecting to a room: {}", e);
+                    let _ = server.send_event(
+                        proto::ConnectCallback {
+                            async_id,
+                            message: Some(proto::connect_callback::Message::Error(e)),
+                            ..Default::default()
+                        }
+                        .into(),
+                    );
+                    return;
+                }
+            }
             match Room::connect(&connect.url, &connect.token, options.clone()).await {
                 Ok((room, mut events)) => {
                     // initialize audio filters

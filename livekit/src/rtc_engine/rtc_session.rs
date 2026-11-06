@@ -41,7 +41,10 @@ use tokio::sync::{
 };
 use tokio::{task::JoinHandle, time::sleep};
 
-use super::{rtc_events, EngineError, EngineOptions, EngineResult, SimulateScenario};
+use super::{
+    ice_forwarder::IceForwarder, rtc_events, EngineError, EngineOptions, EngineResult,
+    SimulateScenario,
+};
 use crate::{
     id::ParticipantIdentity,
     rtc_engine::dc_sender::{DataChannelSender, DataChannelSenderOptions, DataTrackSendQueue},
@@ -540,6 +543,23 @@ impl RtcSession {
         let mut options = options;
         options.rtc_config.enable_sctp_snap = true;
 
+        let ice_forwarder = match options.ice_forwarder.clone() {
+            // Validated once, by `EngineInner::connect`, before any join attempt.
+            Some(fwd) => {
+                if !options.signal_options.single_peer_connection {
+                    return Err(EngineError::Internal(
+                        "ice forwarder: needs single peer connection mode".into(),
+                    ));
+                }
+                // The forwarder admits a session on a check the server sends.
+                // An ICE-lite server sends none.
+                options.signal_options.disable_ice_lite = true;
+                Some(Arc::new(fwd))
+            }
+            None => None,
+        };
+        options.rtc_config = apply_ice_forwarder(options.rtc_config, ice_forwarder.as_deref());
+
         let use_single_pc = options.signal_options.single_peer_connection;
 
         let mut publisher_offer = None;
@@ -548,7 +568,8 @@ impl RtcSession {
                 lk_runtime.pc_factory().create_peer_connection(options.rtc_config.clone())?,
                 proto::SignalTarget::Publisher,
                 true,
-            );
+            )
+            .with_ice_forwarder(ice_forwarder.clone());
 
             // always try to open negotiated data channels and close them if we know the server doesn't support it after receiving the join response
             let dcs = Self::create_data_channels(&publisher_pc, &emitter, true)?;
@@ -589,6 +610,12 @@ impl RtcSession {
 
         // Determine if single PC mode is active based on the path used
         let single_pc_mode = signal_client.is_single_pc_mode_active();
+        if ice_forwarder.is_some() && !single_pc_mode {
+            signal_client.close().await;
+            return Err(EngineError::Connection(
+                "ice forwarder: the server did not accept single peer connection mode".into(),
+            ));
+        }
 
         let Some(participant_info) = SessionParticipantInfo::from_join(&join_response) else {
             Err(EngineError::Internal("Join response missing participant info".into()))?
@@ -598,7 +625,10 @@ impl RtcSession {
         }
 
         let (rtc_emitter, rtc_events) = mpsc::unbounded_channel();
-        let rtc_config = make_rtc_config_join(join_response.clone(), options.rtc_config.clone());
+        let rtc_config = apply_ice_forwarder(
+            make_rtc_config_join(join_response.clone(), options.rtc_config.clone()),
+            ice_forwarder.as_deref(),
+        );
 
         let (dc_emitter, dc_events) = mpsc::unbounded_channel();
 
@@ -641,7 +671,8 @@ impl RtcSession {
                     lk_runtime.pc_factory().create_peer_connection(rtc_config.clone())?,
                     proto::SignalTarget::Publisher,
                     single_pc_mode,
-                );
+                )
+                .with_ice_forwarder(ice_forwarder.clone());
                 let dcs = Self::create_data_channels(&publisher_pc, &emitter, use_negotiated_dcs)?;
                 (publisher_pc, dcs.0, dcs.1, dcs.2)
             };
@@ -650,11 +681,14 @@ impl RtcSession {
         let mut subscriber_pc = if single_pc_mode {
             None
         } else {
-            Some(PeerTransport::new(
-                lk_runtime.pc_factory().create_peer_connection(rtc_config)?,
-                proto::SignalTarget::Subscriber,
-                false,
-            ))
+            Some(
+                PeerTransport::new(
+                    lk_runtime.pc_factory().create_peer_connection(rtc_config)?,
+                    proto::SignalTarget::Subscriber,
+                    false,
+                )
+                .with_ice_forwarder(ice_forwarder.clone()),
+            )
         };
 
         // Forward events received inside the signaling thread to our rtc channel
@@ -1672,18 +1706,28 @@ impl SessionInner {
         match event {
             RtcEvent::IceCandidate { ice_candidate, target } => {
                 log::debug!("local ice_candidate {:?} {:?}", ice_candidate, target);
-                self.signal_client
-                    .send(proto::signal_request::Message::Trickle(proto::TrickleRequest {
-                        candidate_init: serde_json::to_string(&IceCandidateJson {
-                            sdp_mid: ice_candidate.sdp_mid(),
-                            sdp_m_line_index: ice_candidate.sdp_mline_index(),
-                            candidate: ice_candidate.candidate(),
-                        })
-                        .unwrap(),
-                        target: target as i32,
-                        ..Default::default()
-                    }))
-                    .await;
+                // With a forwarder, the room sees only the forwarder's
+                // candidates. They go out for each gathered candidate, so each
+                // peer connection (a full reconnect builds a new one) advertises
+                // them; the server drops the repeats.
+                let candidates = match &self.options.ice_forwarder {
+                    Some(fwd) => fwd.candidates(),
+                    None => vec![ice_candidate.candidate()],
+                };
+                for candidate in candidates {
+                    self.signal_client
+                        .send(proto::signal_request::Message::Trickle(proto::TrickleRequest {
+                            candidate_init: serde_json::to_string(&IceCandidateJson {
+                                sdp_mid: ice_candidate.sdp_mid(),
+                                sdp_m_line_index: ice_candidate.sdp_mline_index(),
+                                candidate,
+                            })
+                            .unwrap(),
+                            target: target as i32,
+                            ..Default::default()
+                        }))
+                        .await;
+                }
             }
             RtcEvent::ConnectionChange { state, target } => {
                 log::debug!("connection change, {:?} {:?}", state, target);
@@ -2397,8 +2441,10 @@ impl SessionInner {
         let reconnect_response = self.signal_client.restart(reason).await?;
         log::debug!("received reconnect response: {:?}", reconnect_response);
 
-        let rtc_config =
-            make_rtc_config_reconnect(reconnect_response.clone(), self.options.rtc_config.clone());
+        let rtc_config = apply_ice_forwarder(
+            make_rtc_config_reconnect(reconnect_response.clone(), self.options.rtc_config.clone()),
+            self.options.ice_forwarder.as_ref(),
+        );
         self.publisher_pc.peer_connection().set_configuration(rtc_config.clone())?;
         if let Some(ref sub_pc) = self.subscriber_pc {
             sub_pc.peer_connection().set_configuration(rtc_config)?;
@@ -2875,6 +2921,22 @@ fn recovery_decision(
     // signal-only failure) or the far end is gone and ICE has not noticed. Indistinguishable
     // until the settle window gives ICE time to time out.
     settled
+}
+
+/// Confine ICE to the forwarder: gather on its one local port, gather no TCP
+/// candidates, and use no ICE server, also none the server offers. A TURN
+/// server would give this participant a path of its own.
+fn apply_ice_forwarder(
+    mut config: RtcConfiguration,
+    forwarder: Option<&IceForwarder>,
+) -> RtcConfiguration {
+    if let Some(fwd) = forwarder {
+        config.ice_servers.clear();
+        config.ice_transport_type = IceTransportsType::All;
+        config.port_range = Some((fwd.local_port, fwd.local_port));
+        config.disable_tcp_candidates = true;
+    }
+    config
 }
 
 macro_rules! make_rtc_config {

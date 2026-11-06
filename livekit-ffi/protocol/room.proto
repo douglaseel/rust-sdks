@@ -369,10 +369,25 @@ message IceServer {
   optional string password = 3;
 }
 
+// A UDP forwarder in front of this participant that all media goes through.
+// It routes each connectivity check by its ICE username fragment and delivers
+// it to one local port. When set: every local description carries `ufrag` and
+// `pwd`, ICE gathers on `local_port` alone and without TCP, the room sees only
+// `addresses` as candidates, remote candidates and ICE servers are not used,
+// the server is asked for full ICE, and the connect fails without single peer
+// connection mode.
+message IceForwarder {
+  repeated string addresses = 1; // "ip:port"; an IPv6 address in brackets
+  required string ufrag = 2;
+  required string pwd = 3;
+  required uint32 local_port = 4;
+}
+
 message RtcConfig {
   optional IceTransportType ice_transport_type = 1;
   optional ContinualGatheringPolicy continual_gathering_policy = 2;
   repeated IceServer ice_servers = 3; // empty fallback to default
+  optional IceForwarder ice_forwarder = 4;
 }
 
 // Options controlling data stream behavior for the room.

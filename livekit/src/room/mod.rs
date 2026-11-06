@@ -59,6 +59,7 @@ pub use self::{
     participant::{ClientCapability, ParticipantKind, ParticipantKindDetail, ParticipantState},
 };
 pub use crate::rtc_engine::SimulateScenario;
+pub use crate::rtc_engine::{IceCredentials, IceForwarder};
 use crate::{
     e2ee::data_track::{DataTrackDecryptionProvider, DataTrackEncryptionProvider},
     participant::ConnectionQuality,
@@ -451,6 +452,10 @@ pub struct RoomOptions {
     /// Timeout for each individual signal connection attempt
     pub connect_timeout: Duration,
     pub data_stream: RoomDataStreamOptions,
+    /// Send all media through an ICE forwarder in front of this participant.
+    /// See [`crate::rtc_engine::ice_forwarder`]. It needs single peer
+    /// connection mode, and the connect fails without it.
+    pub ice_forwarder: Option<IceForwarder>,
 }
 
 impl Default for RoomOptions {
@@ -469,6 +474,7 @@ impl Default for RoomOptions {
             single_peer_connection: true,
             connect_timeout: SIGNAL_CONNECT_TIMEOUT,
             data_stream: Default::default(),
+            ice_forwarder: None,
         }
     }
 }
@@ -585,6 +591,7 @@ impl Room {
                 signal_options,
                 join_retries: options.join_retries,
                 single_peer_connection: options.single_peer_connection,
+                ice_forwarder: options.ice_forwarder.clone(),
             },
             Some(e2ee_manager.clone()),
         )

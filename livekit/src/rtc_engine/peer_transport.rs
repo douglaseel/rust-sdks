@@ -26,7 +26,7 @@ use livekit_protocol as proto;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
-use super::EngineResult;
+use super::{ice_forwarder::IceForwarder, EngineResult};
 
 pub type OnOfferCreated = Box<dyn FnMut(SessionDescription) + Send + Sync>;
 
@@ -57,6 +57,9 @@ pub struct PeerTransport {
 
     /// Counts entries into `Connected`; see [`Self::note_connection_state`].
     connected_generation: AtomicU32,
+
+    /// When set, all media goes through this forwarder. See `ice_forwarder`.
+    ice_forwarder: Option<Arc<IceForwarder>>,
 
     /// Counts exits from `Connected`; see [`Self::note_connection_state`].
     disconnect_generation: AtomicU32,
@@ -91,7 +94,28 @@ impl PeerTransport {
             })),
             connected_generation: AtomicU32::new(0),
             disconnect_generation: AtomicU32::new(0),
+            ice_forwarder: None,
         }
+    }
+
+    /// Send all media of this transport through `forwarder`.
+    pub fn with_ice_forwarder(mut self, forwarder: Option<Arc<IceForwarder>>) -> Self {
+        self.ice_forwarder = forwarder;
+        self
+    }
+
+    /// Put the forwarder's credentials into a local description and remove its
+    /// gathered candidates. Without a forwarder, the description is unchanged.
+    fn forwarder_local(&self, desc: SessionDescription) -> EngineResult<SessionDescription> {
+        let Some(fwd) = &self.ice_forwarder else {
+            return Ok(desc);
+        };
+        let sdp = fwd.rewrite_local_sdp(&desc.to_string());
+        SessionDescription::parse(&sdp, desc.sdp_type()).map_err(|e| {
+            super::EngineError::Internal(
+                format!("ice forwarder: local description does not parse: {e:?}").into(),
+            )
+        })
     }
 
     pub fn is_connected(&self) -> bool {
@@ -143,6 +167,12 @@ impl PeerTransport {
     }
 
     pub async fn add_ice_candidate(&self, ice_candidate: IceCandidate) -> EngineResult<()> {
+        if self.ice_forwarder.is_some() {
+            // Only the checks that arrive through the forwarder are answered.
+            log::debug!("{:?}: ice forwarder: ignoring remote candidate", self.signal_target);
+            return Ok(());
+        }
+
         let mut inner = self.inner.lock().await;
 
         if self.peer_connection.current_remote_description().is_some() && !inner.restarting_ice {
@@ -166,6 +196,17 @@ impl PeerTransport {
             self.peer_connection.set_local_description(pending_offer).await?;
         }
 
+        let remote_description = match &self.ice_forwarder {
+            Some(_) => {
+                let sdp = IceForwarder::strip_remote_sdp(&remote_description.to_string());
+                SessionDescription::parse(&sdp, remote_description.sdp_type()).map_err(|e| {
+                    super::EngineError::Internal(
+                        format!("ice forwarder: remote description does not parse: {e:?}").into(),
+                    )
+                })?
+            }
+            None => remote_description,
+        };
         self.peer_connection.set_remote_description(remote_description).await?;
 
         // Apply every queued candidate, even if one fails. A candidate can be rejected on its
@@ -208,6 +249,7 @@ impl PeerTransport {
     ) -> EngineResult<SessionDescription> {
         self.set_remote_description(offer).await?;
         let answer = self.peer_connection().create_answer(options).await?;
+        let answer = self.forwarder_local(answer)?;
         self.peer_connection().set_local_description(answer.clone()).await?;
 
         Ok(answer)
@@ -241,6 +283,7 @@ impl PeerTransport {
             .create_offer(Self::single_pc_offer_options(OfferOptions::default()))
             .await?;
 
+        let offer = self.forwarder_local(offer)?;
         let mut inner = self.inner.lock().await;
         inner.pending_initial_offer = Some(offer.clone());
         Ok(Some(offer))
@@ -607,6 +650,7 @@ impl PeerTransport {
             }
         }
 
+        let offer = self.forwarder_local(offer)?;
         self.peer_connection.set_local_description(offer.clone()).await?;
 
         // Only consume the one-shot hint once the offer carrying it is accepted locally.
