@@ -333,6 +333,46 @@ mod tests {
     use crate::{peer_connection::*, peer_connection_factory::*};
 
     #[tokio::test]
+    async fn a_pinned_port_range_gathers_only_udp_on_that_port() {
+        let _ = env_logger::builder().is_test(true).try_init();
+
+        // A port that is free now: bind an ephemeral one and release it.
+        let port = std::net::UdpSocket::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port();
+
+        let factory = PeerConnectionFactory::default();
+        let mut config = RtcConfiguration::default();
+        config.continual_gathering_policy = ContinualGatheringPolicy::GatherOnce;
+        config.port_range = Some((port, port));
+        config.disable_tcp_candidates = true;
+        let pc = factory.create_peer_connection(config).unwrap();
+
+        let (ice_tx, mut ice_rx) = mpsc::unbounded_channel::<IceCandidate>();
+        pc.on_ice_candidate(Some(Box::new(move |candidate| {
+            let _ = ice_tx.send(candidate);
+        })));
+        let _dc = pc.create_data_channel("gather", DataChannelInit::default()).unwrap();
+        let offer = pc.create_offer(OfferOptions::default()).await.unwrap();
+        pc.set_local_description(offer).await.unwrap();
+
+        let mut candidates = Vec::new();
+        while let Ok(Some(c)) =
+            tokio::time::timeout(std::time::Duration::from_secs(2), ice_rx.recv()).await
+        {
+            candidates.push(c.candidate());
+        }
+
+        assert!(!candidates.is_empty(), "no candidate was gathered");
+        for candidate in &candidates {
+            // candidate:<foundation> <component> <protocol> <priority> <ip> <port> typ ...
+            let fields: Vec<&str> = candidate.split_whitespace().collect();
+            assert_eq!(fields[2].to_lowercase(), "udp", "{candidate}");
+            assert_eq!(fields[5], port.to_string(), "{candidate}");
+        }
+
+        pc.close();
+    }
+
+    #[tokio::test]
     async fn create_pc() {
         let _ = env_logger::builder().is_test(true).try_init();
 
@@ -346,6 +386,8 @@ mod tests {
             continual_gathering_policy: ContinualGatheringPolicy::GatherOnce,
             ice_transport_type: IceTransportsType::All,
             enable_sctp_snap: false,
+            port_range: None,
+            disable_tcp_candidates: false,
         };
 
         let bob = factory.create_peer_connection(config.clone()).unwrap();

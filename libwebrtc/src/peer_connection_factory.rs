@@ -60,6 +60,11 @@ pub struct RtcConfiguration {
     /// `enable_sctp_snap` RTCConfiguration field, so it must be set the same at
     /// PeerConnection creation and every set_configuration.
     pub enable_sctp_snap: bool,
+    /// Inclusive `(min, max)` local UDP port range ICE gathers on. `None`
+    /// leaves the allocator's default range. `(p, p)` pins one port.
+    pub port_range: Option<(u16, u16)>,
+    /// Gather no TCP candidates.
+    pub disable_tcp_candidates: bool,
 }
 
 impl Default for RtcConfiguration {
@@ -69,6 +74,8 @@ impl Default for RtcConfiguration {
             continual_gathering_policy: ContinualGatheringPolicy::GatherContinually,
             ice_transport_type: IceTransportsType::All,
             enable_sctp_snap: false,
+            port_range: None,
+            disable_tcp_candidates: false,
         }
     }
 }
